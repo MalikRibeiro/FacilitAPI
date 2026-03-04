@@ -1,6 +1,7 @@
-import { db } from "./db";
-import { decrypt } from "./crypto";
-import { Client } from "pg";
+import { pool } from "./db.js";
+import { decrypt } from "./crypto.js";
+import pg from "pg";
+const { Client } = pg;
 import fs from "fs";
 import path from "path";
 
@@ -10,7 +11,8 @@ export async function runETLTask(integrationId: number) {
   
   try {
     // 1. Fetch integration details
-    const integration = db.prepare("SELECT * FROM integrations WHERE id = ?").get(integrationId) as any;
+    const result = await pool.query("SELECT * FROM integrations WHERE id = $1", [integrationId]);
+    const integration = result.rows[0];
     
     if (!integration) {
       throw new Error("Integration not found");
@@ -30,7 +32,8 @@ export async function runETLTask(integrationId: number) {
     
     const response = await fetch(custom_url, {
       method: http_method,
-      headers
+      headers,
+      signal: AbortSignal.timeout(30000) // 30s timeout
     });
 
     if (!response.ok) {
@@ -38,9 +41,21 @@ export async function runETLTask(integrationId: number) {
       throw new Error(`API Error: ${response.status} ${response.statusText} - ${errorText}`);
     }
 
-    let data = await response.json();
+    let rawData = await response.json();
+    let data = rawData;
     
-    // Ensure data is an array
+    // Auto-detect common wrapper if data is not an array
+    if (!Array.isArray(data) && data && typeof data === 'object') {
+      if (Array.isArray(data.data)) {
+        data = data.data;
+      } else if (Array.isArray(data.items)) {
+        data = data.items;
+      } else if (Array.isArray(data.results)) {
+        data = data.results;
+      }
+    }
+
+    // Ensure data is an array for processing
     if (!Array.isArray(data)) {
       data = [data];
     }
@@ -54,7 +69,10 @@ export async function runETLTask(integrationId: number) {
       console.log(`[Worker] Conectando ao banco de destino para inserir ${data.length} registros...`);
       
       if (data.length > 0) {
-        const client = new Client({ connectionString: destination_db_string });
+        const client = new Client({ 
+          connectionString: destination_db_string,
+          ssl: { rejectUnauthorized: false }
+        });
         await client.connect();
         
         try {
@@ -121,10 +139,10 @@ export async function runETLTask(integrationId: number) {
     }
 
     // 4. Log success
-    db.prepare(`
+    await pool.query(`
       INSERT INTO execution_logs (integration_id, status, records_processed, error_message)
-      VALUES (?, ?, ?, ?)
-    `).run(integrationId, "success", recordsProcessed, logMessage);
+      VALUES ($1, $2, $3, $4)
+    `, [integrationId, "success", recordsProcessed, logMessage]);
 
     console.log(`[Worker] ETL task completed successfully for integration ${integrationId}`);
 
@@ -132,9 +150,13 @@ export async function runETLTask(integrationId: number) {
     console.error(`[Worker] ETL task failed:`, error.message);
     
     // Log error
-    db.prepare(`
-      INSERT INTO execution_logs (integration_id, status, error_message)
-      VALUES (?, ?, ?)
-    `).run(integrationId, "error", error.message);
+    try {
+      await pool.query(`
+        INSERT INTO execution_logs (integration_id, status, error_message)
+        VALUES ($1, $2, $3)
+      `, [integrationId, "error", error.message]);
+    } catch (logError) {
+      console.error("[Worker] Failed to log error to database:", logError);
+    }
   }
 }
